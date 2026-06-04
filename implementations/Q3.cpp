@@ -1,105 +1,113 @@
 #include <iostream>
 #include <fstream>
-#include <string>
-#include <vector>
 #include <iomanip>
 #include <openssl/sha.h>
+#include <thread>
+#include <atomic>
+#include <vector>
+#include <cstdint>
 #include <cstring>
-#include <ctime>
 
 using namespace std;
 
-
-vector<unsigned char> hexToBytes(string hex) {
-    vector<unsigned char> bytes;
-    for (unsigned int i = 0; i < hex.length(); i += 2) {
-        bytes.push_back((unsigned char)strtol(hex.substr(i, 2).c_str(), NULL, 16));
+// Convert hex string to bytes
+void hexToBytes(const char* hex, unsigned char* bytes, size_t len) {
+    for (size_t i = 0; i < len; ++i) {
+        sscanf(hex + 2 * i, "%2hhx", &bytes[i]);
     }
-    return bytes;
 }
 
-
-string bytesToHex(const unsigned char* bytes, size_t len) {
-    stringstream ss;
-    for (size_t i = 0; i < len; i++)
-        ss << hex << setw(2) << setfill('0') << (int)bytes[i];
-    return ss.str();
-}
-
-
-void sha256d(const vector<unsigned char>& data, unsigned char* out_hash) {
+// SHA256 duplo
+inline void sha256d(const unsigned char* data, size_t len, unsigned char* out_hash) {
     unsigned char tmp[SHA256_DIGEST_LENGTH];
-    SHA256(data.data(), data.size(), tmp);
+    SHA256(data, len, tmp);
     SHA256(tmp, SHA256_DIGEST_LENGTH, out_hash);
 }
 
+// uint32 little-endian
+inline void uint32ToLE(uint32_t val, unsigned char* buf) {
+    buf[0] = val & 0xFF;
+    buf[1] = (val >> 8) & 0xFF;
+    buf[2] = (val >> 16) & 0xFF;
+    buf[3] = (val >> 24) & 0xFF;
+}
 
-bool checkDifficulty(unsigned char* hash) {
-    
-    for (int i = 0; i < 4; i++) {
-        if (hash[i] != 0) return false;
+// Compare hash with target (BE)
+bool hashLETarget(const unsigned char* hash, const unsigned char* target) {
+    for (int i = 31; i >= 0; --i) {
+        if (hash[i] < target[i]) return true;
+        if (hash[i] > target[i]) return false;
     }
-    return true;
+    return true; // equal
+}
+
+// Shared flag for threads
+atomic<bool> found(false);
+atomic<uint32_t> foundNonce(0);
+unsigned char finalHeader[80];
+
+void mineRange(unsigned char baseHeader[80], uint32_t start, uint32_t step,
+               const unsigned char* target) {
+    unsigned char header[80];
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    memcpy(header, baseHeader, 80);
+
+    for (uint32_t nonce = start; nonce <= 0xffffffff; nonce += step) {
+        if (found.load()) return;
+
+        uint32ToLE(nonce, header + 76);
+        sha256d(header, 80, hash);
+
+        if (hashLETarget(hash, target)) {
+            memcpy(finalHeader, header, 80);
+            foundNonce = nonce;
+            found = true;
+            return;
+        }
+    }
 }
 
 int main() {
-    
-    uint32_t version = 4; 
-    string prev_block_hex = "00000000d1145790a8694403d4063f323d499e655c83426834d4ce2f8dd4a2ee";
-    string merkle_root_hex = "c0a692de10b69e2381a2856dcb0d0736dcd307bf25af7ce74831bf25793de626"; 
-    uint32_t timestamp = 1231006505 + 1000; 
-    uint64_t nonce = 0;
+    const uint32_t version = 2;
+    const char* prev_block_hex = "00000000d1145790a8694403d4063f323d499e655c83426834d4ce2f8dd4a2ee";
+    const char* merkle_root_hex = "c0a692de10b69e2381a2856dcb0d0736dcd307bf25af7ce74831bf25793de626";
+    const uint32_t timestamp = 1231006505;
+    const uint32_t nbits_val = 0x1d00ffff;
 
-    
-    vector<unsigned char> header;
-    
-    
-    for (int i = 3; i >= 0; i--) header.push_back((version >> (i * 8)) & 0xFF);
-    
-    
-    vector<unsigned char> prev = hexToBytes(prev_block_hex);
-    header.insert(header.end(), prev.begin(), prev.end());
-    
-    
-    vector<unsigned char> merkle = hexToBytes(merkle_root_hex);
-    header.insert(header.end(), merkle.begin(), merkle.end());
-    
-   
-    for (int i = 3; i >= 0; i--) header.push_back((timestamp >> (i * 8)) & 0xFF);
+    unsigned char header[80];
+    uint32ToLE(version, header);
+    hexToBytes(prev_block_hex, header + 4, 32);
+    hexToBytes(merkle_root_hex, header + 36, 32);
+    uint32ToLE(timestamp, header + 68);
+    uint32ToLE(nbits_val, header + 72);
 
-    size_t header_base_size = header.size();
-    unsigned char hash[SHA256_DIGEST_LENGTH];
+    // Target 0x1d00ffff -> initial Bitcoin difficulty
+    unsigned char target[32] = {0};
+    target[31] = 0xff;
+    target[30] = 0xff;
+    target[29] = 0x00;
+    target[28] = 0x00;
+    // remaining bytes are 0 by default
 
-    cout << "Minerando... Isso pode levar alguns minutos." << endl;
+    unsigned int nThreads = thread::hardware_concurrency();
+    if (nThreads == 0) nThreads = 4; // fallback
+    cout << "Minerando com " << nThreads << " threads..." << endl;
 
-    
-    while (true) {
-        
-        header.resize(header_base_size);
-        
-       
-        for (int i = 7; i >= 0; i--) header.push_back((nonce >> (i * 8)) & 0xFF);
-
-       
-        sha256d(header, hash);
-
-        
-        if (checkDifficulty(hash)) {
-            cout << "Bloco Minerado!" << endl;
-            cout << "Hash: " << bytesToHex(hash, SHA256_DIGEST_LENGTH) << endl;
-            break;
-        }
-
-        nonce++;
-        if (nonce % 1000000 == 0) cout << "Tentativas: " << nonce << "..." << endl;
+    vector<thread> threads;
+    for (unsigned int i = 0; i < nThreads; ++i) {
+        threads.emplace_back(mineRange, header, i, nThreads, target);
     }
 
-    
-    ofstream outfile("exercise03.txt");
-    if (outfile.is_open()) {
-        outfile << bytesToHex(header.data(), header.size()) << endl;
-        outfile.close();
-        cout << "Resultado salvo em solutions/exercise03.txt" << endl;
+    for (auto& t : threads) t.join();
+
+    if (found.load()) {
+        cout << "Bloco minerado! Nonce: " << foundNonce.load() << endl;
+        ofstream outfile("solutions/exercise03.txt");
+        for (int i = 0; i < 80; ++i)
+            outfile << hex << setw(2) << setfill('0') << (int)finalHeader[i];
+        cout << "Arquivo gerado: solutions/exercise03.txt" << endl;
+    } else {
+        cout << "Nonce válido não encontrado." << endl;
     }
 
     return 0;
